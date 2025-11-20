@@ -19,6 +19,8 @@ from database import db
 JWT_SECRET = os.getenv("JWT_SECRET", "dev_super_secret_change_me")
 JWT_EXPIRES_MIN = int(os.getenv("JWT_EXPIRES_MIN", "60"))
 FRONTEND_URL = os.getenv("FRONTEND_URL", "*")
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "true").lower() == "true"
+COOKIE_SAMESITE = os.getenv("COOKIE_SAMESITE", "none").lower()  # none | lax | strict
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -103,15 +105,19 @@ class MessageCreate(BaseModel):
 # ----------------------------------------------------------------------------
 fastapi_app = FastAPI()
 
+# Configure CORS so cookies can be sent cross-site
+allow_origins = [] if FRONTEND_URL == "*" or not FRONTEND_URL else [FRONTEND_URL]
+allow_origin_regex = r"https?://.*" if not allow_origins else None
 fastapi_app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL] if FRONTEND_URL != "*" else ["*"],
+    allow_origins=allow_origins,
+    allow_origin_regex=allow_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
+sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins=allow_origins or allow_origin_regex or "*")
 asgi_app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app)
 
 # Mapping of userId -> sid
@@ -178,13 +184,14 @@ def login(body: LoginBody, response: Response):
     if not user or not verify_password(body.password, user.get("password", "")):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = create_token(str(user["_id"]))
-    # HTTP-only cookie
+    # HTTP-only cookie for cross-site: SameSite=None; Secure required
+    samesite = "none" if COOKIE_SAMESITE == "none" else ("lax" if COOKIE_SAMESITE == "lax" else "strict")
     response.set_cookie(
         key="token",
         value=token,
         httponly=True,
-        samesite="lax",
-        secure=False,
+        samesite=samesite,  # send on cross-site if 'none'
+        secure=COOKIE_SECURE,
         max_age=JWT_EXPIRES_MIN * 60,
     )
     return {"message": "logged_in", "token": token}
@@ -192,7 +199,8 @@ def login(body: LoginBody, response: Response):
 
 @fastapi_app.post("/auth/logout")
 def logout(response: Response):
-    response.delete_cookie("token")
+    samesite = "none" if COOKIE_SAMESITE == "none" else ("lax" if COOKIE_SAMESITE == "lax" else "strict")
+    response.delete_cookie("token", httponly=True, samesite=samesite, secure=COOKIE_SECURE)
     return {"message": "logged_out"}
 
 
@@ -412,17 +420,24 @@ async def mark_read(conversationId: str, user_id: str = Depends(get_current_user
 # ----------------------------------------------------------------------------
 @sio.event
 async def connect(sid, environ, auth):
-    # Expect token in auth or query string
+    # Expect token in auth, query string, or cookie
     token = None
     if auth and isinstance(auth, dict):
         token = auth.get("token")
-    if token is None:
+    if not token:
         # try query string
         qs = environ.get("QUERY_STRING", "")
-        # token=... in qs
         for part in qs.split("&"):
             if part.startswith("token="):
                 token = part.split("=", 1)[1]
+                break
+    if not token:
+        # try cookie header
+        cookie_header = environ.get("HTTP_COOKIE", "")
+        for part in cookie_header.split(";"):
+            k_v = part.strip().split("=", 1)
+            if len(k_v) == 2 and k_v[0] == "token":
+                token = k_v[1]
                 break
     if not token:
         return False
