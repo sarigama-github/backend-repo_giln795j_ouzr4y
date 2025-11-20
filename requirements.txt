@@ -5,3 +5,7 @@ pydantic>=2.9.0
 pymongo==4.6.0
 requests==2.31.0
 email-validator==2.1.0
+python-socketio[asgi]==5.11.1
+passlib[bcrypt]==1.7.4
+PyJWT==2.8.0
+python-multipart==0.0.9
